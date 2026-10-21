@@ -2173,9 +2173,19 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        self.position_audit = None
+        selected = (sampling or {}).get('_selected_prefill')
+        if selected and (embeddings or self.info.get('selected_prefill') != 1):
+            raise ValueError('selected prefill requires the opt-in text engine')
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        if selected:
+            from serve.selected_prefill import validate
+            _, positions, original, _, _ = validate({
+                'token_ids': ids, 'position_ids': selected['position_ids'],
+                'original_prompt_length': selected['original_prompt_length'], 'max_tokens': max_new}, self.max_context)
+            head += f" positions={','.join(map(str, positions))} original_length={original}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -2223,7 +2233,17 @@ class StrataEngine:
                 beat = heard
                 if stall_state:
                     stall_state.clear()
-                if line.startswith("T "):
+                if line.startswith("POSITION_IDS "):
+                    fields = line.split()
+                    if len(fields) != 4:
+                        raise EngineDied('malformed selected-prefill position acknowledgement')
+                    try:
+                        self.position_audit = {'original_prompt_length': int(fields[1]),
+                                               'position_ids': list(map(int, fields[2].split(','))),
+                                               'next_position': int(fields[3])}
+                    except ValueError:
+                        raise EngineDied('malformed selected-prefill position acknowledgement') from None
+                elif line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
                         return
@@ -6625,6 +6645,11 @@ def make_handler(svc: Service):
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
                     self._json(code, body)
+                elif path == "/v1/strata/generate":
+                    from serve.selected_prefill import generate
+                    cancel = threading.Event()
+                    self._watch_client(cancel)
+                    self._json(200, generate(svc, req, cancel))
                 elif path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
