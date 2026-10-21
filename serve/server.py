@@ -3578,7 +3578,14 @@ class Service:
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
-            text = self.template.render(marked, tools=marked_tools, **kw)
+            try:
+                text = self.template.render(marked, tools=marked_tools, **kw)
+            except ValueError:
+                # Local fix: a template that refuses a prompt with no user turn (Qwen's "No user query found in
+                # messages.") cannot render a system-only prefix; render it with an empty user turn after it and cut
+                # where that turn's text starts.  The common start with the full prompt is taken below as before.
+                text = self.template.render(marked + [{"role": "user", "content": self.PREFIX_END}],
+                                            tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
