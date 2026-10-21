@@ -3,6 +3,10 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/warm_policy.hpp"
 #include <atomic>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
@@ -3398,6 +3402,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     ra_apply(m.z, T, 6144, p0, l, 5);
                     ra_apply(m.ab, T, 96, p0, l, 3);
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    // state-projection research build (opt-in, off unless set): STRATA_DUMP_GDN=<file> appends each GDN
+                    // layer's per-token recurrence inputs - the qkv projection BEFORE the conv (10240), the decay gate
+                    // (pre-exp, 48) and beta (after sigmoid, 48) - for positions with (pos + 1) % STRATA_DUMP_GDN_STRIDE
+                    // == 0 (default 8): records {int32 gdn_index, int32 position, float32[10240 + 48 + 48]}.
+                    static const char* dump_gdn = std::getenv("STRATA_DUMP_GDN");
+                    if (dump_gdn != nullptr) {
+                        static const int dg_stride = [] {
+                            const char* e = std::getenv("STRATA_DUMP_GDN_STRIDE"); return e ? std::max(1, std::atoi(e)) : 8; }();
+                        static std::FILE* dg_file = std::fopen(dump_gdn, "ab");
+                        const int64_t HVd = g.ssm_v_heads, Cd = g.ssm_conv_channels;
+                        std::vector<float> qkv_h((size_t) (T * Cd)), gate_h((size_t) (T * HVd)), beta_h((size_t) (T * HVd));
+                        cudaStreamSynchronize((cudaStream_t) m.cs);
+                        cudaMemcpy(qkv_h.data(), m.qkv, qkv_h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(gate_h.data(), m.gate, gate_h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(beta_h.data(), m.beta, beta_h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        for (int64_t t = 0; dg_file != nullptr && t < T; ++t) {
+                            const int32_t pos = (int32_t) (p0 + t);
+                            if ((pos + 1) % dg_stride != 0) continue;
+                            const int32_t hdr[2] = {(int32_t) gdn_index, pos};
+                            std::fwrite(hdr, sizeof hdr, 1, dg_file);
+                            std::fwrite(qkv_h.data() + (size_t) (t * Cd), sizeof(float), (size_t) Cd, dg_file);
+                            std::fwrite(gate_h.data() + (size_t) (t * HVd), sizeof(float), (size_t) HVd, dg_file);
+                            std::fwrite(beta_h.data() + (size_t) (t * HVd), sizeof(float), (size_t) HVd, dg_file);
+                        }
+                        if (dg_file != nullptr) std::fflush(dg_file);
+                    }
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
@@ -3508,6 +3538,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                    // state-projection research build (opt-in, off unless set): STRATA_DUMP_Q=<file> appends the queries of
+                    // every QSA layer after q_norm and RoPE, for positions with (pos + 1) % STRATA_DUMP_Q_STRIDE == 0
+                    // (default 8): records {int32 qsa_index, int32 position, float32[24 * 256]}.
+                    static const char* dump_q = std::getenv("STRATA_DUMP_Q");
+                    if (dump_q != nullptr) {
+                        static const int dq_stride = [] {
+                            const char* e = std::getenv("STRATA_DUMP_Q_STRIDE"); return e ? std::max(1, std::atoi(e)) : 8; }();
+                        static std::FILE* dq_file = std::fopen(dump_q, "ab");
+                        std::vector<float> dq_host((size_t) T * 6144);
+                        cudaStreamSynchronize((cudaStream_t) m.cs);
+                        cudaMemcpy(dq_host.data(), m.q, dq_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        for (int64_t t = 0; dq_file != nullptr && t < T; ++t) {
+                            const int32_t pos = (int32_t) (p0 + t);
+                            if ((pos + 1) % dq_stride != 0) continue;
+                            const int32_t hdr[2] = {(int32_t) qsa_index, pos};
+                            std::fwrite(hdr, sizeof hdr, 1, dq_file);
+                            std::fwrite(dq_host.data() + (size_t) t * 6144, sizeof(float), 6144, dq_file);
+                        }
+                        if (dq_file != nullptr) std::fflush(dq_file);
+                    }
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
