@@ -56,6 +56,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/program/selected_prefill.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
@@ -607,6 +608,8 @@ struct Options {
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
+    bool selected_prefill = false;    // opt-in original-position text prefill
+    bool selected_prefix_cache = false; // experimental position-bound prefix checkpoints
     bool vision = false;
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
@@ -762,6 +765,8 @@ void usage() {
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
+                 "  --selected-prefill   experimental original-position GEN requests; default --prompt-cache 0\n"
+                 "  --selected-prefix-cache opt-in position-bound prefix cache (no parked conversations)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
@@ -2007,6 +2012,8 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
+        else if (a == "--selected-prefill") o.selected_prefill = true;
+        else if (a == "--selected-prefix-cache") o.selected_prefix_cache = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -2537,6 +2544,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --ple-gguf is required; --no-ple explicitly enables a diagnostic ablation\n");
         return 2;
     }
+    if (o.selected_prefill && (!o.serve || o.vision || o.batch > 0 || (o.prompt_cache != 0 && !o.selected_prefix_cache) ||
+                               !o.layer_split.empty() || o.spec_split)) {
+        std::fprintf(stderr, "strata generate: --selected-prefill requires --serve --prompt-cache 0, single device, no vision/batching/split\n");
+        return 2;
+    }
+    if (o.selected_prefix_cache && (!o.selected_prefill || o.prompt_cache < 1 ||
+                                    o.conversation_cache_mib != 0)) {
+        std::fprintf(stderr, "strata generate: --selected-prefix-cache requires --selected-prefill, --prompt-cache > 0, --conversation-cache-mib 0\n");
+        return 2;
+    }
     // P7 audit: positions, cells and pooled-block indices are cast to int32 on the device path.
     if (o.max_context > 2147483647LL - 8) {
         std::fprintf(stderr, "strata generate: --max-context must be below 2^31\n");
@@ -3059,7 +3076,7 @@ int main(int argc, char** argv) {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
-    if (o.vision) {
+    if (o.vision || o.selected_prefill) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
@@ -7723,6 +7740,8 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        bool previous_selected_request = false;
+        std::vector<int32_t> cached_position_table;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
@@ -9048,6 +9067,8 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        if (o.selected_prefill) std::printf("INFO selected_prefill=1\n");
+        if (o.selected_prefix_cache) std::printf("INFO selected_prefix_cache=1\n");
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -9786,6 +9807,10 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     err.clear();
                 };
+                if (o.selected_prefix_cache) {
+                    refuse("selected-prefix-cache does not support session files with unbound rotary positions");
+                    continue;
+                }
                 auto moving = [&](uint64_t done, uint64_t total) {
                     strata::core::progress_at(save ? "writing a session file, MiB" : "reading a session file, MiB",
                                               (int64_t) (done >> 20));
@@ -10009,6 +10034,8 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            std::string req_positions_text, req_original_length_text;
+            bool req_positions_present = false, req_length_present = false;
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
@@ -10038,7 +10065,9 @@ int main(int argc, char** argv) {
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    if (key == "positions") { req_positions_text = tok.substr(eq + 1); req_positions_present = true; }
+                    else if (key == "original_length") { req_original_length_text = tok.substr(eq + 1); req_length_present = true; }
+                    else if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -10077,9 +10106,28 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            const bool selected = req_positions_present || req_length_present;
+            std::vector<int64_t> req_positions, req_length;
+            std::vector<int32_t> selected_table;
+            if (selected && (!o.selected_prefill || geni || !req_positions_present || !req_length_present ||
+                !parse_i64_list(req_positions_text.c_str(), req_positions, pe) ||
+                !parse_i64_list(req_original_length_text.c_str(), req_length, pe) || req_length.size() != 1 ||
+                !strata::program::selected_prefill_positions(req_positions, n,
+                    req_length.empty() ? 0 : req_length[0], max_new, o.max_context, selected_table, pe))) {
+                std::printf("ERR %s\n", pe.empty() ? "selected prefill is disabled or missing paired positions/original_length" : pe.c_str());
+                continue;
+            }
+            int64_t position_reuse_limit = n;
+            if (o.selected_prefix_cache) {
+                if (selected && previous_selected_request)
+                    position_reuse_limit = strata::program::selected_prefix_limit(cached_position_table, selected_table, n);
+                else if (selected || previous_selected_request)
+                    position_reuse_limit = 0;
+            }
+            if (selected && !o.selected_prefix_cache) { req_ckpt = 0; req_pin = 0; }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            if (geni || !mrope_identity) {
+            if (geni || selected || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
@@ -10089,7 +10137,9 @@ int main(int argc, char** argv) {
                     mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
                     mrope_host[(size_t) c * 3 + 2] = (int32_t) w;
                 };
-                if (!geni) {
+                if (selected) {
+                    mrope_host.swap(selected_table);
+                } else if (!geni) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                 } else {
                     struct Img { int64_t n, nx, ny; size_t off; };
@@ -10166,7 +10216,19 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-                mrope_identity = !geni;
+                mrope_identity = !geni && !selected;
+                if (selected) {
+                    // Verify the device table consumed by all rotary kernels, not just request metadata.
+                    std::vector<int32_t> observed(mrope_host.size());
+                    if (cudaMemcpy(observed.data(), d_mrope, observed.size() * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess || observed != mrope_host) {
+                        std::printf("ERR selected prefill device position verification failed\n");
+                        return 1;
+                    }
+                    std::printf("POSITION_IDS %lld %s %d\n", (long long) req_length[0],
+                                req_positions_text.c_str(), observed[(size_t) n * 3]);
+                    std::fflush(stdout);
+                }
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
             if (n + max_new + 8 > o.max_context) {
@@ -10198,7 +10260,7 @@ int main(int argc, char** argv) {
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
                 const int64_t L = (int64_t) pre.size();
-                if (L < 1 || L > n - 1) return false;
+                if (L < 1 || L > n - 1 || (o.selected_prefix_cache && L > position_reuse_limit)) return false;
                 for (int64_t i = 0; i < L; ++i)
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
@@ -12053,6 +12115,10 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
+            if (o.selected_prefix_cache) {
+                cached_position_table = mrope_host;
+                previous_selected_request = selected;
+            }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)
