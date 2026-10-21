@@ -1582,7 +1582,10 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r >= 0) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -1600,7 +1603,8 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         ww[k] = w[t * 10 + k];
-        v[k] = *reinterpret_cast<const float4*>(Dm + (int64_t) slot[t * 10 + k] * N + d);
+        const int32_t r = slot[t * 10 + k];
+        v[k] = r >= 0 ? *reinterpret_cast<const float4*>(Dm + (int64_t) r * N + d) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
@@ -2209,6 +2213,27 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,
                                                                                 ld16 > 0 ? ld16 : 24 * 256);
     check("gate_attn");
+}
+
+namespace {
+__global__ void research_ablate_rows_kernel(float* x, int64_t total, int64_t width,
+                                          int mode, int stride) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int64_t row = i / width;
+    // Anchors are never written in hold mode, so no cross-block read/write race.
+    if (mode == 2) {
+        if (row % stride) x[i] = x[(row / stride * stride) * width + i % width];
+    } else if (stride == 1 || row % stride) x[i] = 0.0f;
+}
+}
+void research_ablate_rows(float* x, int64_t rows, int64_t width, int64_t prefix,
+                         int mode, int stride, void* stream) {
+    const int64_t total = std::min(rows, prefix) * width;
+    if (total <= 0) return;
+    research_ablate_rows_kernel<<<blocks_for(total), 256, 0, (cudaStream_t) stream>>>(
+        x, total, width, mode, stride);
+    check("research_ablate_rows");
 }
 
 }  // namespace strata::prefill
