@@ -56,6 +56,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+option(STRATA_RESEARCH_ADAPTIVE_PREFILL "Research-only default: top-2/3 prefill at selected-weight mass 0.35" OFF)
 # AMD gfx906 (MI50, wave64): the same .cu sources compiled as HIP through the gfx906 compat layer.  The CUDA runtime and
 # cuBLAS names are mapped by the headers in include/strata/platform/hip_compat/, which go first on the include path,
 # and CUDA::cudart / CUDA::cublas become aliases of HIP's targets, so every CUDA target below stays as it is.  This is
@@ -590,6 +591,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  if(STRATA_RESEARCH_ADAPTIVE_PREFILL)
+    target_compile_definitions(strata_prefill PRIVATE STRATA_RESEARCH_ADAPTIVE_PREFILL=1)
+  endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
