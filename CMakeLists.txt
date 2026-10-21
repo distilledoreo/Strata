@@ -67,6 +67,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+option(STRATA_RESEARCH_ADAPTIVE_PREFILL "Research-only default: top-2/3 prefill at selected-weight mass 0.35" OFF)
 # AMD gfx906 (MI50, wave64): the same .cu sources compiled as HIP through the gfx906 compat layer.  The CUDA runtime and
 # cuBLAS names are mapped by the headers in include/strata/platform/hip_compat/, which go first on the include path,
 # and CUDA::cudart / CUDA::cublas become aliases of HIP's targets, so every CUDA target below stays as it is.  This is
@@ -715,6 +716,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # v100/gdn-chunk: the chunked Volta GDN prompt recurrence.  The dispatch (src/prefill/kernels.cu) is
     # Volta-only (cc 7.0) and gated on STRATA_EXPERIMENTAL_SM60; the path itself stays opt-in (STRATA_GDN_CHUNK).
     target_sources(strata_prefill PRIVATE src/prefill/gdn_chunk.cu)
+  endif()
+  if(STRATA_RESEARCH_ADAPTIVE_PREFILL)
+    target_compile_definitions(strata_prefill PRIVATE STRATA_RESEARCH_ADAPTIVE_PREFILL=1)
   endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
