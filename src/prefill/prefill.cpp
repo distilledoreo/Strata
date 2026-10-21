@@ -878,6 +878,7 @@ struct Prefill::Impl {
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
+    std::map<std::string, std::vector<uint8_t>> research_lr_host; // opt-in immutable FP16 factor files, CPU only
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
@@ -2479,6 +2480,113 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
     return true;
 }
 
+// Research low-rank factors, off by default. Control: full_from on the first line, then
+// layer kind(1=gate,2=shared-QKV/gate) absolute-factor-file rows. All later decode stays native.
+struct ResearchLrSpec { int kind = 0; std::string path; };
+bool research_lr_control(int64_t& full, std::map<int, ResearchLrSpec>& specs, std::string& err) {
+    full = 0;
+    const char* path = std::getenv("STRATA_LOWRANK_FILE");
+    if (!path) return true;
+    std::FILE* f = std::fopen(path, "r");
+    long long limit = 0;
+    if (!f || std::fscanf(f, "%lld", &limit) != 1 || limit < 0) {
+        if (f) std::fclose(f);
+        err = "prefill: invalid low-rank control";
+        return false;
+    }
+    full = limit;
+    int l = 0, kind = 0, got = 0; char file[4096];
+    while ((got = std::fscanf(f, "%d %d %4095s", &l, &kind, file)) == 3) {
+        if (l < 0 || l >= 48 || l % 4 == 3 || (kind != 1 && kind != 2) || specs.count(l)) {
+            std::fclose(f); err = "prefill: invalid/duplicate low-rank layer"; return false;
+        }
+        specs.emplace(l, ResearchLrSpec{kind, file});
+    }
+    std::fclose(f);
+    if (got != EOF) { err = "prefill: truncated low-rank control row"; return false; }
+    return true;
+}
+bool research_lr_project(Gemm& gm, const ResearchLrSpec& spec, int layer, const uint16_t* input,
+                         float* qkv, float* z, float* mid, uint16_t* mid16, int64_t T,
+                         std::map<std::string, std::vector<uint8_t>>& cache, std::string& err) {
+    auto it = cache.find(spec.path);
+    if (it == cache.end()) {
+        std::FILE* f = std::fopen(spec.path.c_str(), "rb");
+        if (!f) { err = "prefill: cannot open low-rank factor " + spec.path; return false; }
+        std::fseek(f, 0, SEEK_END); const long size = std::ftell(f); std::rewind(f);
+        if (size < 64 || (uint64_t) size > (uint64_t) gm.scratch_elems() * 2 + 64) {
+            std::fclose(f); err = "prefill: low-rank factor exceeds scratch"; return false;
+        }
+        std::vector<uint8_t> raw((size_t) size);
+        const bool ok = std::fread(raw.data(), 1, raw.size(), f) == raw.size(); std::fclose(f);
+        if (!ok) { err = "prefill: low-rank factor read failed"; return false; }
+        it = cache.emplace(spec.path, std::move(raw)).first;
+    }
+    const auto& raw = it->second;
+    int64_t h[8]; std::memcpy(h, raw.data(), sizeof h);
+    const int64_t rank = h[4], nq = spec.kind == 2 ? 10240 : 0;
+    if (h[0] != 0x5354524c523031LL || h[1] != 1 || h[2] != layer || h[3] != 2560 ||
+        rank < 1 || rank > 1536 || h[5] != spec.kind || h[6] != nq || h[7] != 6144 ||
+        raw.size() != 64 + (size_t) rank * (2560 + nq + 6144) * 2) {
+        err = "prefill: invalid low-rank factor header/size"; return false;
+    }
+    // Existing dequant scratch holds the factors. Existing GDN y/y_h hold the intermediate.
+    // All calls are ordered on the prefill stream; native alpha/beta may reuse scratch afterwards.
+    auto* weights = gm.scratch();
+    if (cudaMemcpyAsync(weights, raw.data() + 64, raw.size() - 64, cudaMemcpyHostToDevice,
+                        (cudaStream_t) gm.stream()) != cudaSuccess) {
+        err = "prefill: low-rank factor upload failed"; return false;
+    }
+    gm.f16(input, weights, mid, T, rank, 2560);
+    to_f16(mid, mid16, T * rank, gm.stream());
+    const uint16_t* a = weights + rank * 2560;
+    if (spec.kind == 2) { gm.f16(mid16, a, qkv, T, 10240, rank); a += rank * 10240; }
+    gm.f16(mid16, a, z, T, 6144, rank);
+    if (const char* stats = std::getenv("STRATA_LOWRANK_STATS"); stats && stats[0] == '1')
+        std::fprintf(stderr, "LR_FACTORED layer=%d tokens=%lld kind=%d rank=%lld uploaded=%zu extra_explicit_device_bytes=0\n",
+                     layer, (long long) T, spec.kind, (long long) rank, raw.size() - 64);
+    return true;
+}
+
+// STRATA_DUMP_PROJ_ACT=<file> STRATA_DUMP_PROJ_LAYERS=0,24,46
+// Appends int32 layer, kind, T, dim and tightly packed FP16[T*dim]. Kind 1 is the shared QKV/gate input.
+void dump_proj_act(int layer, int kind, int64_t T, int64_t dim, int64_t stride, const uint16_t* src, cudaStream_t cs) {
+    if (const char* input_only = std::getenv("STRATA_DUMP_PROJ_INPUT_ONLY"); input_only && input_only[0] == '1' && kind != 1) return;
+    const char* path = std::getenv("STRATA_DUMP_PROJ_ACT");
+    if (!path || !src || T <= 0) return;
+    static const std::vector<int> layers = [] {
+        std::vector<int> v;
+        const char* e = std::getenv("STRATA_DUMP_PROJ_LAYERS");
+        if (!e) return v;
+        std::stringstream ss(e);
+        for (std::string x; std::getline(ss, x, ',');) if (!x.empty()) v.push_back(std::atoi(x.c_str()));
+        return v;
+    }();
+    if (std::find(layers.begin(), layers.end(), layer) == layers.end()) return;
+    cudaStreamSynchronize(cs);
+    std::vector<uint16_t> host((size_t) T * dim);
+    if (stride == dim) {
+        cudaMemcpy(host.data(), src, host.size() * 2, cudaMemcpyDeviceToHost);
+    } else {
+        std::vector<uint16_t> padded((size_t) T * stride);
+        cudaMemcpy(padded.data(), src, padded.size() * 2, cudaMemcpyDeviceToHost);
+        for (int64_t t = 0; t < T; ++t) std::memcpy(host.data() + t * dim, padded.data() + t * stride, (size_t) dim * 2);
+    }
+    int32_t tag = 0;
+    if (const char* tag_path = std::getenv("STRATA_DUMP_PROJ_TAG")) {
+        if (std::FILE* tf = std::fopen(tag_path, "r")) {
+            if (std::fscanf(tf, "%d", &tag) != 1) tag = 0;
+            std::fclose(tf);
+        }
+    }
+    std::FILE* f = std::fopen(path, "ab");
+    if (!f) return;
+    const int32_t hdr[5] = {layer, kind, (int32_t) T, (int32_t) dim, tag};
+    std::fwrite(hdr, sizeof hdr, 1, f);
+    std::fwrite(host.data(), 2, host.size(), f);
+    std::fclose(f);
+}
+
 }  // namespace
 
 namespace {
@@ -2488,11 +2596,14 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
+               kPfGdnQkv, kPfGdnZ, kPfGdnAlpha, kPfGdnBeta, kPfQsaK, kPfQsaV, kPfQsaQ, kPfQsaIdxK, kPfQsaIdxQ, kPfQsaOut,
                kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write"};
+                                        "gdn recurrence", "gdn out proj", "hc write",
+                                        "gdn qkv", "gdn z", "gdn alpha", "gdn beta",
+                                        "qsa k", "qsa v", "qsa q", "qsa indexer k", "qsa indexer q", "qsa out"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -2580,6 +2691,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    int64_t lr_full = 0; std::map<int, ResearchLrSpec> lr_specs;
+    if (!research_lr_control(lr_full, lr_specs, err)) return false;
+    // Opt-in quality screen: full_from family first_layer last_layer mode stride capture.
+    // family: 1 GDN output, 2 attention output, 3 GDN inputs, 4 attention Q/gate.
+    // family 5: GDN readout gate only. mode: 1 zero, 2 reuse preceding anchor. Decode and positions >= full_from unchanged.
+    long long ra_full = 0;
+    int ra_family = 0, ra_first = 0, ra_last = -1, ra_mode = 0, ra_stride = 1, ra_capture = 0;
+    if (const char* path = std::getenv("STRATA_ABLATE_FILE")) {
+        std::FILE* f = std::fopen(path, "r");
+        const int got = f ? std::fscanf(f, "%lld %d %d %d %d %d %d", &ra_full, &ra_family,
+                                       &ra_first, &ra_last, &ra_mode, &ra_stride, &ra_capture) : 0;
+        if (f) std::fclose(f);
+        if (got != 7 || ra_full < 0 || ra_family < 0 || ra_family > 5 || ra_first < 0 ||
+            ra_last > 47 || ra_mode < 0 || ra_mode > 2 || ra_stride < 1 || ra_stride > 16) {
+            err = "prefill: invalid research ablation control"; return false;
+        }
+    }
+    const auto ra_apply = [&](float* x, int64_t rows, int64_t width, int64_t p0,
+                              int64_t layer, int family) {
+        if (ra_family == family && layer >= ra_first && layer <= ra_last && ra_mode && p0 < ra_full)
+            research_ablate_rows(x, rows, width, ra_full - p0, ra_mode, ra_stride, m.cs);
+    };
+
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
@@ -3225,14 +3359,44 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
-                    pt.mark(kPfGdn, cs);
+                    if (pt.on && gdn_index == ss.gdn_ord0) {
+                        auto shape = [&](const char* label, const core::WeightRef* w, const char* kind) {
+                            const double gflop = 2.0 * (double) T * (double) w->ne0 * (double) w->ne1 / 1e9;
+                            std::fprintf(stderr, "strata proj shape: %s %s K=%lld N=%lld T=%lld GFLOP=%.2f ggml_type=%d\n",
+                                         label, kind, (long long) w->ne0, (long long) w->ne1, (long long) T, gflop,
+                                         w->native_type);
+                        };
+                        shape("gdn qkv", wqkv, "native");
+                        shape("gdn z", wg, "native");
+                        shape("gdn alpha", wa, "bf16");
+                        shape("gdn beta", wb, "bf16");
+                        shape("gdn out", wo, "native");
+                    }
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    dump_proj_act((int) l, 1, T, N, N, m.mixed_h, m.cs);
+                    const auto lr_it = lr_specs.find((int) l);
+                    const bool lr_on = lr_it != lr_specs.end() && T >= 64 && p0 < lr_full;
+                    if (lr_on && p0 + T > lr_full) { err = "prefill: low-rank cutoff splits a chunk"; return false; }
+                    pt.mark(kPfGdnQkv, cs);
+                    if (lr_on && lr_it->second.kind == 2) {
+                        if (!research_lr_project(m.gemm, lr_it->second, (int) l, m.mixed_h, m.qkv, m.z,
+                                                 m.y, m.y_h, T, m.research_lr_host, err)) return false;
+                    } else if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    pt.mark(kPfGdnZ, cs);
+                    if (lr_on && lr_it->second.kind == 1) {
+                        if (!research_lr_project(m.gemm, lr_it->second, (int) l, m.mixed_h, m.qkv, m.z,
+                                                 m.y, m.y_h, T, m.research_lr_host, err)) return false;
+                    } else if (!lr_on && !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    pt.mark(kPfGdnAlpha, cs);
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    pt.mark(kPfGdnBeta, cs);
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
+                    pt.mark(kPfGdnConv, cs);   // the four projections above; conv, recurrence, and out stay separate
+                    ra_apply(m.qkv, T, 10240, p0, l, 3);
+                    ra_apply(m.z, T, 6144, p0, l, 3);
+                    ra_apply(m.z, T, 6144, p0, l, 5);
+                    ra_apply(m.ab, T, 96, p0, l, 3);
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
@@ -3240,6 +3404,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
                                    ld_y);
                     pt.mark(kPfGdnOut, cs);
+                    dump_proj_act((int) l, 2, T, ZV, ld_y > 0 ? ld_y : ZV, m.y_h, m.cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
@@ -3253,12 +3418,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wiqn = need(v, "indexer.q_norm.weight", err),
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
-                    pt.mark(kPfQsa, cs);
+                    if (pt.on && qsa_index == 0) {
+                        auto shape = [&](const char* label, const core::WeightRef* w, const char* kind) {
+                            const double gflop = 2.0 * (double) T * (double) w->ne0 * (double) w->ne1 / 1e9;
+                            std::fprintf(stderr, "strata proj shape: %s %s K=%lld N=%lld T=%lld GFLOP=%.2f ggml_type=%d\n",
+                                         label, kind, (long long) w->ne0, (long long) w->ne1, (long long) T, gflop,
+                                         w->native_type);
+                        };
+                        shape("qsa k", wk, "native");
+                        shape("qsa v", wv, "native");
+                        shape("qsa q", wq, "native");
+                        shape("qsa indexer k", wik, "bf16");
+                        shape("qsa indexer q", wiq, "bf16");
+                        shape("qsa out", wo, "native");
+                    }
+                    pt.mark(kPfQsaK, cs);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    pt.mark(kPfQsaV, cs);
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    pt.mark(kPfQsaQ, cs);
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    pt.mark(kPfQsaIdxK, cs);
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    pt.mark(kPfQsaIdxQ, cs);
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    ra_apply(m.Qf, T, 12288, p0, l, 4);
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
@@ -3478,6 +3662,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
+                    pt.mark(kPfQsaOut, cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
@@ -3492,6 +3677,125 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    // RESEARCH (expert budget, opt-in, never on by default): STRATA_XB_FILE=<file> holds
+                    // "<full_from> <k_0> <k_1> ... <k_47>". Prompt positions before full_from keep only their top k_l routed
+                    // experts in layer l (weights renormalised over the kept ones); positions from full_from on keep all 10.
+                    // Re-read for every chunk, so a harness can change it per request.
+                    // STRATA_XB_K=<k> (no file): every token of chunks with T >= STRATA_XB_MIN_T (default 64) keeps its
+                    // top-k routed experts. The file takes precedence when STRATA_XB_FILE is set.
+                    // REAL SKIPPING: a pruned pair gets id -1 and weight 0 and is skipped by grouping/combine, so its
+                    // expert work and loads are saved (not just zero-weighted).
+                    bool xb_active = false;
+                    {
+                        static const char* xb_path = std::getenv("STRATA_XB_FILE");
+                        static const int xb_k = [] { const char* e = std::getenv("STRATA_XB_K"); return e ? std::atoi(e) : 10; }();
+                        static const int64_t xb_min_t = [] { const char* e = std::getenv("STRATA_XB_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 64; }();
+                        // Optional research policy: "full_from mass_threshold min_k max_k [one_mass_threshold]".
+                        // Mass is relative to the original selected top-10 weights. Missing/invalid
+                        // files disable this policy. Decode and positions >= full_from stay native.
+                        static const char* xa_path = std::getenv("STRATA_XB_ADAPT_FILE");
+                        static const bool xa_stats = std::getenv("STRATA_XB_ADAPT_STATS") != nullptr;
+                        // The separate research build can opt in at configure time. Ordinary
+                        // builds remain off. Explicit experiment files/fixed-K settings take
+                        // precedence; MASS=0 turns the research preset off at runtime.
+                        static const float xa_preset_mass = [] {
+                            if (const char* e = std::getenv("STRATA_XB_ADAPT_MASS")) return (float) std::atof(e);
+#if defined(STRATA_RESEARCH_ADAPTIVE_PREFILL) && STRATA_RESEARCH_ADAPTIVE_PREFILL
+                            return 0.35f;
+#else
+                            return 0.0f;
+#endif
+                        }();
+                        float xa_threshold = 0.0f;
+                        float xa_one_threshold = 0.0f;
+                        int xa_min = 10, xa_max = 10;
+                        long long xa_full = 0;
+                        bool xa_active = false;
+                        if (xa_path != nullptr) {
+                            if (std::FILE* f = std::fopen(xa_path, "r")) {
+                                const int fields = std::fscanf(f, "%lld %f %d %d %f", &xa_full, &xa_threshold, &xa_min, &xa_max, &xa_one_threshold);
+                                std::fclose(f);
+                                if (fields == 4) xa_one_threshold = xa_threshold;
+                                xa_active = fields >= 4 && xa_threshold > 0.0f && xa_threshold <= 1.0f &&
+                                    xa_one_threshold >= xa_threshold && xa_one_threshold <= 1.0f &&
+                                    xa_min >= 1 && xa_max <= 10 && xa_min <= xa_max && (long long) p0 < xa_full;
+                            }
+                        } else if (xb_path == nullptr && std::getenv("STRATA_XB_K") == nullptr &&
+                                   xa_preset_mass > 0.0f && xa_preset_mass <= 1.0f &&
+                                   T >= std::max<int64_t>(64, xb_min_t)) {
+                            xa_threshold = xa_one_threshold = xa_preset_mass;
+                            xa_min = 2;
+                            xa_max = 3;
+                            xa_full = (long long) p0 + (long long) T;
+                            xa_active = true;
+                            static const bool announced = [&] {
+                                std::fprintf(stderr, "strata prefill: research adaptive preset: 2-3 routed experts, mass %.3f, chunks >= %lld tokens; decode unchanged\n",
+                                             (double) xa_preset_mass, (long long) std::max<int64_t>(64, xb_min_t));
+                                return true;
+                            }();
+                            (void) announced;
+                        }
+                        int kk = 10;
+                        int64_t nb = 0;
+                        if (xb_path != nullptr) {
+                            long long full_from = 0; int kl[64];
+                            for (int& x : kl) x = 10;
+                            if (std::FILE* f = std::fopen(xb_path, "r")) {
+                                if (std::fscanf(f, "%lld", &full_from) != 1) full_from = 0;
+                                for (int i = 0; i < 64; ++i) if (std::fscanf(f, "%d", &kl[i]) != 1) break;
+                                std::fclose(f);
+                            }
+                            kk = std::max(1, std::min(10, kl[l & 63]));
+                            if (kk < 10 && (long long) p0 < full_from)
+                                nb = std::min<int64_t>(T, (int64_t) (full_from - (long long) p0));
+                        } else if (xb_k < 10 && xb_k >= 1 && T >= xb_min_t) {
+                            kk = xb_k;
+                            nb = T;
+                        }
+                        if (xa_active) {
+                            nb = std::min<int64_t>(T, (int64_t) (xa_full - (long long) p0));
+                        }
+                        if (nb > 0) {
+                            std::vector<float> hw((size_t) nb * 10);
+                            std::vector<int32_t> hid((size_t) nb * 10);
+                            cudaStreamSynchronize((cudaStream_t) m.cs);
+                            cudaMemcpy(hw.data(), m.w, hw.size() * 4, cudaMemcpyDeviceToHost);
+                            cudaMemcpy(hid.data(), m.ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+                            int64_t xa_counts[10] = {};
+                            for (int64_t t = 0; t < nb; ++t) {
+                                int keep = kk;
+                                if (xa_active) {
+                                    float total = 0.0f, cumulative = 0.0f;
+                                    for (int r = 0; r < 10; ++r) total += hw[(size_t) t * 10 + r];
+                                    keep = xa_max;
+                                    for (int r = 0; r < xa_max; ++r) {
+                                        cumulative += hw[(size_t) t * 10 + r];
+                                        const float required = r == 0 ? xa_one_threshold : xa_threshold;
+                                        if (r + 1 >= xa_min && cumulative >= required * total) {
+                                            keep = r + 1;
+                                            break;
+                                        }
+                                    }
+                                    ++xa_counts[keep - 1];
+                                }
+                                float sum = 0.0f;
+                                for (int r = 0; r < keep; ++r) sum += hw[(size_t) t * 10 + r];
+                                sum = std::max(sum, 6.103515625e-5f);
+                                for (int r = 0; r < 10; ++r) {
+                                    if (r < keep) hw[(size_t) t * 10 + r] /= sum;
+                                    else { hw[(size_t) t * 10 + r] = 0.0f; hid[(size_t) t * 10 + r] = -1; }
+                                }
+                            }
+                            cudaMemcpy(m.w, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice);
+                            cudaMemcpy(m.ids, hid.data(), hid.size() * 4, cudaMemcpyHostToDevice);
+                            if (xa_active && xa_stats) {
+                                std::fprintf(stderr, "XB_ADAPT layer=%d p0=%lld tokens=%lld counts=", (int) l, (long long) p0, (long long) nb);
+                                for (int r = 0; r < 10; ++r) std::fprintf(stderr, "%s%lld", r ? "," : "", (long long) xa_counts[r]);
+                                std::fprintf(stderr, "\n");
+                            }
+                            xb_active = true;
+                        }
+                    }
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -3619,6 +3923,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;                // auto: one-time costs in the window (no reading)
                     if (fused_l) {
+                        if (xb_active) { err = "prefill: XB expert skipping is not supported on the fused path yet"; return false; }
                         if (static bool said = false; !said) {
                             said = true;
                             std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, "
@@ -3807,9 +4112,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
+                            if (e == -1 && xb_active) continue;   // XB pruned pair: no row, no load
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        if (xb_active && m.pp) { err = "prefill: XB expert skipping is not supported with a peer device"; return false; }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                             int64_t nstream = 0;
@@ -3880,11 +4187,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
-                            rows_local -= rows_cpu;
+                            if (xb_active) rows_local = r - rows_peer - rows_cpu;
+                            else rows_local -= rows_cpu;
                         }
                         std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
+                            if (e == -1 && xb_active) { slot_h[(size_t) i] = -1; continue; }
                             const int32_t p = fill[(size_t) e]++;
                             slot_h[(size_t) i] = p;
                             src_h[(size_t) p] = (int32_t) (i / K);
@@ -3907,7 +4216,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool sort_all = detail::mmq_resident_sort_requested();
                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                        // adaptive top-k: pruned pairs (id -1) have no row to sort, so the opt-in sort stays off for them
+                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty() && !xb_active, use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
@@ -3970,7 +4280,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 std::fill(m.cpu_ones, m.cpu_ones + n1, 1.0f);
                                 m.cpu_ones_n = n1;
                             }
-                            const int64_t r0c = T * K - rows_cpu;
+                            const int64_t r0c = (xb_active ? m.off[(size_t) m.g->n_expert] : T * K) - rows_cpu;
                             const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                             if (cpu_share_env() < 0.0) {
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
@@ -4033,15 +4343,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // (slot_dev, the inverse of src_dev).
                             // NVFP4 w4a4 activations carry a per-row scale (Xscale): that mode keeps the gather.
                             if (wmma_l) {   // FP16 rows (pf_wmma); APR: Hadamard-folded gate/up take H, rotated in fp16 storage as the FP16 path does
-                                gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
-                                if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                                gather_rows16(m.mixed_h, m.src_dev, m.Xs, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, N, m.cs);
+                                if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, N, had_block, had_sx, m.cs);
                             } else {
                                 if (had_gu) {
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                                     xsrc = m.Xr;
                                 }
                                 if (mmq::fp4_activations(mmq_gt))
-                                    mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
+                                    mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, m.cs, m.Xscale);
+                                else if (xb_active)   // adaptive top-k: pruned pairs have slot -1; gather by row instead
+                                    mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, m.cs);
                                 else
                                     mmq::quantize_scatter(xsrc, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             }
@@ -4066,10 +4378,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                         } else {
-                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, N, m.cs);
                             // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
                             // (rotated in fp16 storage, fp32 arithmetic: see the down projection's note below)
-                            if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                            if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, xb_active ? m.off[(size_t) m.g->n_expert] : T * K, N, had_block, had_sx, m.cs);
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
                         peer_now = use_mmq && !order_peer.empty();
@@ -4578,7 +4890,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
-                                gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                gu.total_rows = xb_active ? m.off[(size_t) m.g->n_expert] : T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
                                 m.mmq_ctx->run(gu, m.cs);
@@ -4718,7 +5030,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.pend_n_gpu = n_stream - n_cpu;
                         }
                         stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
-                        const int64_t r0c = T * K - rows_cpu;
+                        const int64_t r0c = (xb_active ? m.off[(size_t) m.g->n_expert] : T * K) - rows_cpu;
                         cudaMemcpyAsync(m.Dm + (size_t) r0c * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                         cudaMemcpyHostToDevice, m.cs);
                         if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off)
@@ -4758,8 +5070,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
                         // (the CPU's rows, the last rows_cpu of GU and H, are never written by the GPU: not checked)
-                        const int64_t gpu_rows = T * K - rows_cpu;
-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * 1280), bdm = bad(m.Dm, T * K * N),
+                        const int64_t gpu_rows = (xb_active ? m.off[(size_t) m.g->n_expert] : T * K) - rows_cpu;
+                        const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * 1280), bdm = bad(m.Dm, (xb_active ? m.off[(size_t) m.g->n_expert] : T * K) * N),
                                       bbo = bad(m.bo, T * N);
                         const int64_t bh = m.H && !fused_l ? bad(m.H, gpu_rows * 640) : -1;
                         static int64_t reported = -1;
@@ -4771,6 +5083,40 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          (long long) T);
                         }
                     }
+                }
+                if (half == 0) {
+                    // Baseline controller data: sampled normalized input (FP16), branch output (FP32),
+                    // residual streams (FP32), then GDN gate/beta (FP32; absent on attention).
+                    // Records: int64[4] {layer, absolute position, kind(1=GDN/2=attention), version=1}.
+                    if (ra_capture && p0 < ra_full) {
+                        const char* path = std::getenv("STRATA_ABLATE_FEATURES");
+                        std::FILE* f = path ? std::fopen(path, "ab") : nullptr;
+                        if (!f) { err = "prefill: research feature file unavailable"; return false; }
+                        if (cudaStreamSynchronize((cudaStream_t) m.cs) != cudaSuccess) {
+                            std::fclose(f); err = "prefill: research feature sync failed"; return false;
+                        }
+                        const bool gdn = !core::is_qsa_layer(g, l);
+                        std::vector<uint16_t> h(N);
+                        std::vector<float> b(N), r(N * HC), gates(2 * HV);
+                        for (int64_t t = 0; t < T && p0 + t < ra_full; ++t) {
+                            if ((p0 + t) % 64 != 0 && (p0 + t + 1) % 64 != 0) continue;
+                            const int64_t hdr[4] = {l, p0 + t, gdn ? 1 : 2, 1};
+                            bool ok = cudaMemcpy(h.data(), m.mixed_h + t * N, N * 2, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                                      cudaMemcpy(b.data(), m.bo + t * N, N * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                                      cudaMemcpy(r.data(), m.R + t * N * HC, N * HC * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                            if (gdn) ok = ok &&
+                                cudaMemcpy(gates.data(), m.gate + t * HV, HV * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                                cudaMemcpy(gates.data() + HV, m.beta + t * HV, HV * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                            ok = ok && std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+                                std::fwrite(h.data(), 2, h.size(), f) == h.size() &&
+                                std::fwrite(b.data(), 4, b.size(), f) == b.size() &&
+                                std::fwrite(r.data(), 4, r.size(), f) == r.size();
+                            if (gdn) ok = ok && std::fwrite(gates.data(), 4, gates.size(), f) == gates.size();
+                            if (!ok) { std::fclose(f); err = "prefill: research feature capture failed"; return false; }
+                        }
+                        if (std::fclose(f) != 0) { err = "prefill: research feature close failed"; return false; }
+                    }
+                    ra_apply(m.bo, T, N, p0, l, core::is_qsa_layer(g, l) ? 2 : 1);
                 }
                 pt.mark(kPfHcWrite, cs);   // the write-back (and the next half's norm) on its own line; it used to be charged to the phase before
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
